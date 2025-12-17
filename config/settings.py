@@ -26,10 +26,15 @@ load_dotenv(BASE_DIR / ".env")  # <- lee exactamente backend/.env
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv("SECRET_KEY","y3ot%33odk7)q7wv4a6w^#hcnxb419^6#yzotd4uxh9#6uve_v")
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv("DEBUG", "0") == "1"
+DEBUG = os.getenv("DEBUG", "False") == "True"
 
-# 👇 MODIFICA ESTA LÍNEA 👇
-ALLOWED_HOSTS = ['*'] # <-- AÑADE TU IP AQUÍ
+# Allowed hosts for production
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+if os.getenv("RENDER"):
+    ALLOWED_HOSTS.append(os.getenv("RENDER_EXTERNAL_HOSTNAME"))
+
+# CSRF and Security settings for production
+CSRF_TRUSTED_ORIGINS = os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",") if os.getenv("CSRF_TRUSTED_ORIGINS") else []
 
 
 # Application definition
@@ -74,6 +79,7 @@ REST_FRAMEWORK = {
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",  # << debe ir ARRIBA de CommonMiddleware
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',  # << Para servir archivos estáticos en producción
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -169,30 +175,20 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Permite al frontend (Vite) acceder a la API durante desarrollo
-CORS_ALLOWED_ORIGINS = [
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "http://127.0.0.1:5174",
-    "http://localhost:5174",
-    "http://127.0.0.1:5175",
-    "http://localhost:5175",
-]
+# CORS Configuration - permite al frontend acceder a la API
+CORS_ALLOWED_ORIGINS = os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5174,http://localhost:5174"
+).split(",")
 
-CSRF_TRUSTED_ORIGINS = [
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "http://127.0.0.1:5174",
-    "http://localhost:5174",
-    "http://127.0.0.1:5175",
-    "http://localhost:5175",
-]
+# CSRF Trusted Origins - actualizado arriba con CSRF_TRUSTED_ORIGINS
 
 # Si vas a mandar cookies/sesiones desde el frontend:
 # CORS_ALLOW_CREDENTIALS = True
