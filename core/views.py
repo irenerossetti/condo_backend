@@ -4,6 +4,7 @@ from django.contrib.auth import authenticate, get_user_model
 from django.db.models import Sum, Q, Value, F, Count, DecimalField
 from django.conf import settings
 from django.db.models.functions import Coalesce
+from decimal import Decimal
 from rest_framework import viewsets, permissions, filters, status, serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -14,11 +15,16 @@ from rest_framework.exceptions import PermissionDenied
 import mercadopago
 from django.db import models
 from django.utils import timezone
+import os  # 👈 Para las variables de entorno como la API Key
+import base64  # 👈 Para procesar la imagen
+from openai import OpenAI  # 👈 Para usar la IA
+from rest_framework.decorators import api_view, permission_classes # 👈 Para crear la vista de API
 
 from .models import (
     ActivityLog, CommonArea, ExpenseType, FamilyMember, Fee, MaintenanceRequest,
     MaintenanceRequestComment, Notice, NoticeCategory, Notification,
-    Payment, Pet, Profile, Reservation, Unit, Vehicle, MaintenanceRequestAttachment
+    Payment, Pet, Profile, Reservation, Unit, Vehicle, MaintenanceRequestAttachment,
+    Visitor, SecurityIncident
 )
 from .serializers import (
     ActivityLogSerializer, AdminUserWriteSerializer, CommonAreaSerializer,
@@ -38,28 +44,85 @@ User = get_user_model()
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
     authentication_classes = []
+    
     def post(self, request):
         data = request.data
         identifier = (data.get("email") or data.get("username") or "").strip()
         password = (data.get("password") or "").strip()
+        
         if not identifier or not password:
             return Response({"detail": "Faltan credenciales"}, status=status.HTTP_400_BAD_REQUEST)
+        
         user_lookup = {"email__iexact": identifier} if "@" in identifier else {"username__iexact": identifier}
         user_obj = User.objects.filter(**user_lookup).first()
+        
         if not user_obj:
             return Response({"detail": "Credenciales inválidas"}, status=status.HTTP_401_UNAUTHORIZED)
+        
         user = authenticate(request, username=user_obj.username, password=password)
+        
         if not user:
             return Response({"detail": "Credenciales inválidas"}, status=status.HTTP_401_UNAUTHORIZED)
-        ActivityLog.objects.create(user=user, action="USER_LOGIN_SUCCESS")
+        
+        # Obtener IP del cliente
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip_address = x_forwarded_for.split(',')[0]
+        else:
+            ip_address = request.META.get('REMOTE_ADDR')
+        
+        # Registrar login exitoso con detalles completos
+        ActivityLog.objects.create(
+            user=user,
+            action="USER_LOGIN_SUCCESS",
+            description=f"Inició sesión desde {ip_address}",
+            ip_address=ip_address,
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
+            path=request.path,
+            method='POST',
+            session_key=request.session.session_key if hasattr(request, 'session') else ''
+        )
+        
         refresh = RefreshToken.for_user(user)
-        return Response({"access": str(refresh.access_token), "refresh": str(refresh)})
+        return Response({
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "full_name": user.profile.full_name if hasattr(user, 'profile') else user.get_full_name()
+            }
+        })
 
 
 class LogoutView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    
     def post(self, request):
-        ActivityLog.objects.create(user=request.user, action="USER_LOGOUT")
+        # Determinar si es logout manual o por expiración
+        logout_type = request.data.get('logout_type', 'manual')
+        action = 'USER_LOGOUT_MANUAL' if logout_type == 'manual' else 'USER_LOGOUT_EXPIRED'
+        
+        # Obtener IP del cliente
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip_address = x_forwarded_for.split(',')[0]
+        else:
+            ip_address = request.META.get('REMOTE_ADDR')
+        
+        # Registrar logout con detalles
+        ActivityLog.objects.create(
+            user=request.user,
+            action=action,
+            description=f"Cerró sesión {'manualmente' if logout_type == 'manual' else 'por expiración de token'}",
+            ip_address=ip_address,
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
+            path=request.path,
+            method='POST',
+            session_key=request.session.session_key if hasattr(request, 'session') else ''
+        )
+        
         return Response({"detail": "Sesión cerrada correctamente."})
 
 
@@ -156,7 +219,6 @@ class NoticeCategoryViewSet(viewsets.ModelViewSet):
             return [IsAdmin()]
         return super().get_permissions()
 
-
 class NoticeViewSet(viewsets.ModelViewSet):
     serializer_class = NoticeSerializer
     def get_queryset(self):
@@ -165,6 +227,14 @@ class NoticeViewSet(viewsets.ModelViewSet):
         return [permissions.IsAuthenticated()] if self.action in ("list", "retrieve") else [IsAdmin()]
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    # 👇 AÑADE ESTA NUEVA FUNCIÓN DENTRO DE LA CLASE NoticeViewSet 👇
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def mark_as_viewed(self, request, pk=None):
+        notice = self.get_object()
+        # Añadimos el usuario actual a la lista de 'viewed_by'
+        notice.viewed_by.add(request.user)
+        return Response({'status': 'notice marked as viewed'}, status=status.HTTP_200_OK)    
 
 
 class CommonAreaViewSet(viewsets.ModelViewSet):
@@ -190,14 +260,19 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
 
 class MaintenanceRequestViewSet(viewsets.ModelViewSet):
-    queryset = MaintenanceRequest.objects.all().order_by('-created_at')
+    queryset = MaintenanceRequest.objects.select_related(
+        'unit', 'reported_by', 'assigned_to', 'completed_by'
+    ).prefetch_related('comments', 'attachments').all().order_by('-created_at')
     serializer_class = MaintenanceRequestSerializer
     permission_classes = [permissions.IsAuthenticated]
+    
     def get_queryset(self):
         user = self.request.user
+        queryset = self.queryset
         if not (user.is_staff or getattr(user.profile, 'role', 'RESIDENT') == 'ADMIN'):
-            return self.queryset.filter(reported_by=user)
-        return self.queryset
+            queryset = queryset.filter(reported_by=user)
+        return queryset
+    
     def perform_create(self, serializer):
         serializer.save(reported_by=self.request.user)
 
@@ -222,8 +297,10 @@ class MaintenanceRequestAttachmentViewSet(viewsets.ModelViewSet):
 class NotificationViewSet(viewsets.ModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
+    
     def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user)
+        return Notification.objects.filter(user=self.request.user).order_by('-created_at')
+    
     @action(detail=False, methods=['post'])
     def mark_all_as_read(self, request):
         self.get_queryset().update(is_read=True)
@@ -265,13 +342,101 @@ class PageAccessLogView(APIView):
 
 class DashboardStatsView(APIView):
     permission_classes = [IsAdmin]
+
     def get(self, request):
-        return Response({
-            "total_users": User.objects.count(),
-            "active_units": Unit.objects.count(),
-            "pending_fees_total": Fee.objects.filter(status__in=["ISSUED", "OVERDUE"]).aggregate(total=Sum('amount'))['total'] or 0,
-            "open_maintenance_requests": MaintenanceRequest.objects.filter(status__in=["PENDING", "IN_PROGRESS"]).count(),
-        })
+        from django.db.models import Count, Q
+        from datetime import timedelta
+        
+        try:
+            # Calculamos los totales de todas las cuotas emitidas históricamente
+            fee_aggregates = Fee.objects.aggregate(
+                total_issued=Coalesce(Sum('amount'), Decimal('0.0')),
+                total_paid=Coalesce(Sum('payments__amount'), Decimal('0.0'))
+            )
+
+            total_issued = fee_aggregates['total_issued']
+            total_paid = fee_aggregates['total_paid']
+            total_outstanding = total_issued - total_paid
+
+            # --- NUEVA LÓGICA PARA LOS INDICADORES ---
+            delinquency_rate = 0
+            collection_rate = 100
+
+            if total_issued > 0:
+                # Tasa de Morosidad: (Lo que se debe / Lo que se emitió) * 100
+                delinquency_rate = (total_outstanding / total_issued) * 100
+                # Tasa de Cobranza: (Lo que se pagó / Lo que se emitió) * 100
+                collection_rate = (total_paid / total_issued) * 100
+
+            # --- DATOS PARA GRÁFICAS ---
+            
+            # 1. Cuotas por estado
+            fees_by_status = list(Fee.objects.values('status').annotate(count=Count('id')))
+            
+            # 2. Usuarios por rol
+            users_by_role = list(Profile.objects.values('role').annotate(value=Count('id')))
+            for item in users_by_role:
+                item['name'] = dict(Profile.ROLE_CHOICES).get(item['role'], item['role'])
+            
+            # 3. Mantenimiento por estado
+            maintenance_by_category = list(
+                MaintenanceRequest.objects.values('status')
+                .annotate(count=Count('id'))
+                .order_by('-count')
+            )
+            for item in maintenance_by_category:
+                item['category'] = item['status']  # Renombrar para compatibilidad con el frontend
+            
+            # 4. Visitantes por mes (últimos 6 meses)
+            six_months_ago = timezone.now() - timedelta(days=180)
+            visitors_by_month = []
+            for i in range(6):
+                month_start = timezone.now() - timedelta(days=30 * (5 - i))
+                month_end = month_start + timedelta(days=30)
+                count = Visitor.objects.filter(
+                    entry_time__gte=month_start,
+                    entry_time__lt=month_end
+                ).count()
+                visitors_by_month.append({
+                    'month': month_start.strftime('%b'),
+                    'visitors': count
+                })
+            
+            # 5. Incidentes de seguridad por tipo
+            incidents_by_type = list(
+                SecurityIncident.objects.values('incident_type')
+                .annotate(count=Count('id'))
+                .order_by('-count')
+            )
+            for item in incidents_by_type:
+                item['type'] = dict(SecurityIncident.INCIDENT_TYPES).get(item['incident_type'], item['incident_type'])
+                item.pop('incident_type')
+
+            return Response({
+                "total_users": User.objects.count(),
+                "active_units": Unit.objects.count(),
+                "pending_fees_total": float(total_outstanding),
+                "open_maintenance_requests": MaintenanceRequest.objects.filter(status__in=["PENDING", "IN_PROGRESS"]).count(),
+                "delinquency_rate": round(delinquency_rate, 2),
+                "collection_rate": round(collection_rate, 2),
+                
+                # Datos para gráficas
+                "charts": {
+                    "fees_by_status": fees_by_status,
+                    "users_by_role": users_by_role,
+                    "maintenance_by_category": maintenance_by_category,
+                    "visitors_by_month": visitors_by_month,
+                    "incidents_by_type": incidents_by_type,
+                }
+            })
+        except Exception as e:
+            import traceback
+            print(f"Error en DashboardStatsView: {str(e)}")
+            print(traceback.format_exc())
+            return Response(
+                {"error": str(e), "detail": "Error al obtener estadísticas del dashboard"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class FinanceReportView(APIView):
@@ -369,3 +534,231 @@ class MercadoPagoWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
     def post(self, request, *args, **kwargs):
         return Response(status=status.HTTP_200_OK)
+    
+# ... (al final del archivo, después de MercadoPagoWebhookView)
+
+# --- Vista para Reconocimiento de Placas y Control de Acceso ---
+
+# Configuración del cliente para la API de IA (OpenRouter)
+# Lee la API Key de forma segura desde el archivo .env
+try:
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
+except Exception as e:
+    print(f"ERROR: No se pudo inicializar el cliente de OpenAI. Revisa tu API Key. Error: {e}")
+    client = None
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAdminUser]) # O [permissions.IsAuthenticated] si cualquier usuario puede usarlo
+def vehicle_recognition_view(request):
+    """
+    Recibe una imagen de un vehículo, extrae la placa usando IA,
+    y verifica si el vehículo tiene acceso autorizado.
+    """
+    if not client:
+        return Response(
+            {"error": "El servicio de IA no está configurado correctamente en el servidor."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+    image_file = request.FILES.get('vehicle_image')
+    if not image_file:
+        return Response({'error': 'No se proporcionó ninguna imagen.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        # 1. Convertir la imagen a formato base64 para enviarla a la API
+        image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+        # Usamos el formato "data URI" que la API de OpenAI/OpenRouter entiende
+        image_data_url = f"data:{image_file.content_type};base64,{image_base64}"
+
+        # 2. Enviar la imagen a la IA con un prompt específico para OCR de placas
+        completion = client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": os.getenv("SITE_URL", ""),
+                "X-Title": os.getenv("SITE_NAME", ""),
+            },
+            model="x-ai/grok-4-fast:free",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            # ¡Este prompt es clave! Le pedimos a la IA que solo devuelva la placa.
+                            "text": "Analiza esta imagen e identifica la placa del vehículo. Responde únicamente con el texto de la placa, sin espacios, guiones ni explicaciones. Si no puedes leer una placa, responde 'ILEGIBLE'."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": { "url": image_data_url }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=20, # Limitamos la respuesta para que sea corta y precisa
+            temperature=0.1 # Poca creatividad para que no invente placas
+        )
+
+        plate_text = completion.choices[0].message.content.strip().upper()
+
+        if not plate_text or 'ILEGIBLE' in plate_text:
+            return Response({
+                'status': 'denied',
+                'reason': 'Placa no detectada o ilegible.',
+                'api_response': plate_text
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. Verificar si la placa existe en tu base de datos (modelo Vehicle)
+        try:
+            # Buscamos un vehículo que coincida con la placa leída
+            # y cuyo propietario esté activo.
+            vehicle = Vehicle.objects.get(plate__iexact=plate_text, owner__is_active=True)
+
+            # ¡Éxito! El vehículo está registrado y su dueño está activo.
+            return Response({
+                'status': 'granted',
+                'license_plate': plate_text,
+                'owner_username': vehicle.owner.username,
+                'vehicle_brand': vehicle.brand,
+                'vehicle_model': vehicle.model
+            })
+        except Vehicle.DoesNotExist:
+            # La placa fue leída pero no está en la base de datos o el dueño no está activo.
+            return Response({
+                'status': 'denied',
+                'reason': 'Vehículo no autorizado.',
+                'license_plate': plate_text
+            }, status=status.HTTP_403_FORBIDDEN)
+
+    except Exception as e:
+        # Captura cualquier otro error (ej. la API de OpenRouter falla, etc.)
+        return Response({'error': f'Ocurrió un error inesperado: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # ... (al final de tus otras vistas)
+from django.db.models import Count
+
+class OccupancyReportView(APIView):
+    permission_classes = [IsAdmin] # Solo los admins pueden ver este reporte
+
+    def get(self, request):
+        # Obtenemos todas las unidades, con información del dueño y contando sus vehículos/mascotas
+        queryset = Unit.objects.select_related('owner', 'owner__profile').annotate(
+            vehicle_count=Count('owner__vehicles', distinct=True),
+            pet_count=Count('owner__pets', distinct=True)
+        ).order_by('code')
+
+        # Preparamos los datos para enviar al frontend
+        report_data = []
+        for unit in queryset:
+            report_data.append({
+                'unit_code': unit.code,
+                'owner_username': unit.owner.username,
+                'owner_full_name': unit.owner.profile.full_name,
+                'owner_email': unit.owner.email,
+                'owner_phone': unit.owner.profile.phone,
+                'vehicle_count': unit.vehicle_count,
+                'pet_count': unit.pet_count,
+            })
+
+        return Response(report_data)   
+
+
+# --- ViewSets para Chat ---
+from .serializers import ConversationSerializer, MessageSerializer
+from .models import Conversation, Message, MessageReadStatus
+
+class ConversationViewSet(viewsets.ModelViewSet):
+    serializer_class = ConversationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        # Solo mostrar conversaciones donde el usuario es participante
+        return Conversation.objects.filter(
+            participants=self.request.user
+        ).prefetch_related('participants').order_by('-last_message_at')
+    
+    def perform_create(self, serializer):
+        conversation = serializer.save()
+        # Asegurar que el creador sea participante
+        if self.request.user not in conversation.participants.all():
+            conversation.participants.add(self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def mark_all_as_read(self, request, pk=None):
+        """Marcar todos los mensajes de la conversación como leídos"""
+        conversation = self.get_object()
+        messages = conversation.messages.exclude(sender=request.user)
+        
+        for message in messages:
+            MessageReadStatus.objects.get_or_create(
+                message=message,
+                user=request.user
+            )
+        
+        return Response({'status': 'marked as read'})
+    
+    @action(detail=True, methods=['get'])
+    def messages(self, request, pk=None):
+        """Obtener mensajes de una conversación"""
+        conversation = self.get_object()
+        messages = conversation.messages.select_related('sender').order_by('created_at')
+        
+        # Paginación
+        page = self.paginate_queryset(messages)
+        if page is not None:
+            serializer = MessageSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = MessageSerializer(messages, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'], url_path='messages')
+    def create_message(self, request, pk=None):
+        """Crear un mensaje en una conversación"""
+        conversation = self.get_object()
+        
+        serializer = MessageSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                conversation=conversation,
+                sender=request.user
+            )
+            
+            # Actualizar último mensaje de la conversación
+            conversation.update_last_message(serializer.instance)
+            
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class MessageViewSet(viewsets.ModelViewSet):
+    serializer_class = MessageSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        # Solo mensajes de conversaciones donde el usuario es participante
+        return Message.objects.filter(
+            conversation__participants=self.request.user
+        ).select_related('sender', 'conversation').order_by('-created_at')
+    
+    def perform_create(self, serializer):
+        serializer.save(sender=self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def mark_as_read(self, request, pk=None):
+        """Marcar un mensaje como leído"""
+        message = self.get_object()
+        MessageReadStatus.objects.get_or_create(
+            message=message,
+            user=request.user
+        )
+        return Response({'status': 'marked as read'})
+
+
+# Vista de prueba para exportación
+class TestExportView(APIView):
+    permission_classes = [IsAdmin]
+    
+    def get(self, request):
+        return Response({"message": "Test export endpoint works!"})

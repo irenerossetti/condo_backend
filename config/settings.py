@@ -14,14 +14,12 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 import dj_database_url
-#esto es para ajustes finos, reincio de semana y tiempo
 from datetime import timedelta
-import dj_database_url
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")  # <- lee exactamente backend/.env
-
+#load_dotenv() # Carga las variables del archivo .env
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
@@ -30,12 +28,14 @@ SECRET_KEY = os.getenv("SECRET_KEY","y3ot%33odk7)q7wv4a6w^#hcnxb419^6#yzotd4uxh9
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+# 👇 MODIFICA ESTA LÍNEA 👇
+ALLOWED_HOSTS = ['*'] # <-- AÑADE TU IP AQUÍ
 
 
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',  # Debe ir primero para WebSocket
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -50,6 +50,7 @@ INSTALLED_APPS = [
     "django_filters",
     "drf_spectacular",
     "todos",  # tu app
+    "channels",  # Para WebSocket
 ]
 
 REST_FRAMEWORK = {
@@ -67,6 +68,7 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 10,
+    "URL_FORMAT_OVERRIDE": None,  # Disable format query parameter to avoid conflicts
 }
 
 MIDDLEWARE = [
@@ -78,6 +80,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'core.middleware.ActivityLogMiddleware',  # << Registra automáticamente todas las acciones
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -98,6 +101,21 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
+
+# Channels configuration
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [(os.getenv('REDIS_HOST', '127.0.0.1'), int(os.getenv('REDIS_PORT', 6379)))],
+        },
+    },
+}
+
+# Chat configuration
+MAX_UPLOAD_SIZE = 10485760  # 10MB en bytes
+WEBSOCKET_HEARTBEAT_INTERVAL = 30
 
 
 # Database
@@ -107,7 +125,9 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASES = {
     "default": dj_database_url.config(
-        default=f"sqlite:///{BASE_DIR/'db.sqlite3'}",
+        # Esta línea le dice a Django que use la URL del archivo .env
+        # Si no hay DATABASE_URL, usa SQLite por defecto
+        default=os.getenv('DATABASE_URL', f'sqlite:///{BASE_DIR / "db.sqlite3"}'), 
         conn_max_age=600,
     )
 }
@@ -147,7 +167,8 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -158,18 +179,26 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
+    "http://127.0.0.1:5174",
+    "http://localhost:5174",
+    "http://127.0.0.1:5175",
+    "http://localhost:5175",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
+    "http://127.0.0.1:5174",
+    "http://localhost:5174",
+    "http://127.0.0.1:5175",
+    "http://localhost:5175",
 ]
 
 # Si vas a mandar cookies/sesiones desde el frontend:
 # CORS_ALLOW_CREDENTIALS = True
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=8),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
 }
 

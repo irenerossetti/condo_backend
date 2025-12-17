@@ -1,4 +1,3 @@
-# core/services/fees.py
 from __future__ import annotations
 from django.db import transaction
 from django.db.models import Sum
@@ -7,6 +6,7 @@ from core.models import Unit, ExpenseType, Fee, Payment
 
 @transaction.atomic
 def issue_fees(period: str, expense_type_id: int | None = None, amount: float | None = None) -> int:
+    # ... (esta función no cambia)
     if not period or len(period) != 7 or period[4] != "-":
         raise ValueError("period debe ser 'YYYY-MM'")
 
@@ -46,7 +46,11 @@ def register_payment(fee_id: int, amount: float, method: str | None = None, note
     )
     total_paid = Payment.objects.filter(fee=fee).aggregate(s=Sum("amount"))["s"] or 0
 
-    target_paid_value = getattr(Fee.Status, "PAID", "PAID")  # por si usas enum o string
+    # --- LÍNEA CORREGIDA ---
+    # El valor que queremos para el estado es simplemente el string "PAID".
+    # La línea anterior era innecesariamente compleja y tenía el error de mayúsculas.
+    target_paid_value = "PAID"
+
     if float(total_paid) >= float(fee.amount) and fee.status != target_paid_value:
         fee.status = target_paid_value
         fee.save(update_fields=["status"])

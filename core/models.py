@@ -64,6 +64,8 @@ class Notice(models.Model):
     publish_date = models.DateTimeField(default=timezone.now)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
     category = models.ForeignKey(NoticeCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name="notices")
+    viewed_by = models.ManyToManyField(settings.AUTH_USER_MODEL, related_name='viewed_notices', blank=True)
+    
     class Meta:
         ordering = ["-publish_date"]
 
@@ -99,14 +101,48 @@ class MaintenanceRequest(models.Model):
     def __str__(self): return self.title
 
 class ActivityLog(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    action = models.CharField(max_length=255)
+    ACTION_CHOICES = [
+        ('USER_LOGIN_SUCCESS', 'Inicio de sesión exitoso'),
+        ('USER_LOGOUT_MANUAL', 'Cierre de sesión manual'),
+        ('USER_LOGOUT_EXPIRED', 'Cierre de sesión por expiración'),
+        ('PAGE_ACCESS', 'Acceso a página'),
+        ('CREATE', 'Creación de registro'),
+        ('UPDATE', 'Actualización de registro'),
+        ('DELETE', 'Eliminación de registro'),
+        ('PAYMENT_CREATED', 'Pago creado'),
+        ('RESERVATION_CREATED', 'Reservación creada'),
+        ('MAINTENANCE_REQUEST', 'Solicitud de mantenimiento'),
+        ('NOTICE_PUBLISHED', 'Aviso publicado'),
+        ('PROFILE_UPDATED', 'Perfil actualizado'),
+        ('PASSWORD_CHANGED', 'Contraseña cambiada'),
+        ('AI_FACE_RECOGNITION', 'Reconocimiento facial'),
+        ('AI_VEHICLE_RECOGNITION', 'Reconocimiento de vehículo'),
+        ('AI_VISITOR_REGISTERED', 'Visitante registrado con IA'),
+        ('AI_ANOMALY_DETECTED', 'Anomalía detectada'),
+        ('SECURITY_INCIDENT', 'Incidente de seguridad'),
+    ]
+    
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='activity_logs')
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES)
+    description = models.CharField(max_length=255, blank=True)  # Descripción corta de la acción
+    details = models.TextField(blank=True, null=True)  # Detalles adicionales en JSON
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)  # Navegador/dispositivo
+    path = models.CharField(max_length=255, blank=True)  # URL/ruta accedida
+    method = models.CharField(max_length=10, blank=True)  # GET, POST, PUT, DELETE
     timestamp = models.DateTimeField(auto_now_add=True)
-    details = models.TextField(blank=True, null=True)
+    session_key = models.CharField(max_length=40, blank=True, null=True)  # Para rastrear sesiones
 
     class Meta:
         ordering = ['-timestamp']
-    def __str__(self): return f'{self.user.username} - {self.action} at {self.timestamp.strftime("%Y-%m-%d %H:%M")}'
+        indexes = [
+            models.Index(fields=['-timestamp']),
+            models.Index(fields=['user', '-timestamp']),
+            models.Index(fields=['action']),
+        ]
+    
+    def __str__(self): 
+        return f'{self.user.username} - {self.get_action_display()} - {self.ip_address} - {self.timestamp.strftime("%Y-%m-%d %H:%M:%S")}'
 
 class MaintenanceRequestComment(models.Model):
     request = models.ForeignKey('MaintenanceRequest', on_delete=models.CASCADE, related_name='comments')
@@ -156,3 +192,220 @@ class MaintenanceRequestAttachment(models.Model):
     file = models.ImageField(upload_to=maintenance_attachment_path)
     uploaded_at = models.DateTimeField(auto_now_add=True)
     def __str__(self): return f"Adjunto para la solicitud {self.request.id}"
+
+# ... (al final de tus otros modelos como Profile, Unit, etc.)
+
+class AuthorizedVehicle(models.Model):
+    license_plate = models.CharField(max_length=10, unique=True, verbose_name="Placa")
+    owner_name = models.CharField(max_length=100, verbose_name="Nombre del Propietario")
+    is_active = models.BooleanField(default=True, verbose_name="Acceso Activo")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.license_plate} - {self.owner_name}"
+
+# --- MODELOS PARA IA Y SEGURIDAD ---
+
+class FaceEncoding(models.Model):
+    """Almacena encodings faciales de residentes para reconocimiento"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="face_encodings")
+    encoding_data = models.TextField(help_text="Encoding facial en formato JSON")
+    photo = models.ImageField(upload_to='face_photos/', help_text="Foto de referencia")
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+    
+    def __str__(self):
+        return f"Face encoding para {self.user.username}"
+
+class Visitor(models.Model):
+    """Registro de visitantes con foto y reconocimiento automático"""
+    full_name = models.CharField(max_length=200)
+    document_id = models.CharField(max_length=50, blank=True)
+    photo = models.ImageField(upload_to='visitors/')
+    visiting_unit = models.ForeignKey(Unit, on_delete=models.SET_NULL, null=True, related_name="visitors")
+    entry_time = models.DateTimeField(auto_now_add=True)
+    exit_time = models.DateTimeField(null=True, blank=True)
+    authorized_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="authorized_visitors")
+    notes = models.TextField(blank=True)
+    is_authorized = models.BooleanField(default=False)
+    
+    class Meta:
+        ordering = ['-entry_time']
+    
+    def __str__(self):
+        return f"{self.full_name} - {self.entry_time.strftime('%Y-%m-%d %H:%M')}"
+
+class SecurityIncident(models.Model):
+    """Incidentes detectados por IA"""
+    INCIDENT_TYPES = [
+        ('UNAUTHORIZED_PERSON', 'Persona No Autorizada'),
+        ('LOOSE_PET', 'Mascota Suelta'),
+        ('PET_WASTE', 'Mascota Haciendo Necesidades'),
+        ('WRONG_PARKING', 'Vehículo Mal Estacionado'),
+        ('SUSPICIOUS_BEHAVIOR', 'Comportamiento Sospechoso'),
+        ('UNAUTHORIZED_VEHICLE', 'Vehículo No Autorizado'),
+        ('OTHER', 'Otro'),
+    ]
+    
+    incident_type = models.CharField(max_length=30, choices=INCIDENT_TYPES)
+    description = models.TextField()
+    photo = models.ImageField(upload_to='incidents/', null=True, blank=True)
+    detected_at = models.DateTimeField(auto_now_add=True)
+    location = models.CharField(max_length=200, blank=True, help_text="Ubicación del incidente")
+    confidence_score = models.FloatField(default=0.0, help_text="Nivel de confianza de la IA (0-1)")
+    is_resolved = models.BooleanField(default=False)
+    resolved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="resolved_incidents")
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    
+    class Meta:
+        ordering = ['-detected_at']
+    
+    def __str__(self):
+        return f"{self.get_incident_type_display()} - {self.detected_at.strftime('%Y-%m-%d %H:%M')}"
+
+class AccessLog(models.Model):
+    """Log de accesos con reconocimiento facial/vehicular"""
+    ACCESS_TYPES = [
+        ('FACIAL', 'Reconocimiento Facial'),
+        ('VEHICLE', 'Reconocimiento Vehicular'),
+        ('MANUAL', 'Manual'),
+        ('VISITOR', 'Visitante'),
+    ]
+    
+    access_type = models.CharField(max_length=20, choices=ACCESS_TYPES)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="access_logs")
+    visitor = models.ForeignKey(Visitor, on_delete=models.SET_NULL, null=True, blank=True, related_name="access_logs")
+    timestamp = models.DateTimeField(auto_now_add=True)
+    photo = models.ImageField(upload_to='access_logs/', null=True, blank=True)
+    was_granted = models.BooleanField(default=True)
+    confidence_score = models.FloatField(default=0.0)
+    notes = models.TextField(blank=True)
+    
+    class Meta:
+        ordering = ['-timestamp']
+    
+    def __str__(self):
+        person = self.user.username if self.user else (self.visitor.full_name if self.visitor else "Desconocido")
+        return f"{self.get_access_type_display()} - {person} - {self.timestamp.strftime('%Y-%m-%d %H:%M')}"
+  
+
+
+# --- MODELOS PARA SISTEMA DE CHAT ---
+
+class Conversation(models.Model):
+    """Conversación entre usuarios (directa o grupo)"""
+    CONVERSATION_TYPES = [
+        ('DIRECT', 'Conversación Directa'),
+        ('GROUP', 'Grupo'),
+    ]
+    
+    type = models.CharField(max_length=10, choices=CONVERSATION_TYPES)
+    name = models.CharField(max_length=200, blank=True, help_text="Nombre del grupo (solo para grupos)")
+    description = models.TextField(blank=True, help_text="Descripción del grupo")
+    participants = models.ManyToManyField(User, related_name='conversations')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_conversations')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Metadata para optimización
+    last_message_at = models.DateTimeField(null=True, blank=True)
+    last_message_preview = models.CharField(max_length=200, blank=True)
+    
+    class Meta:
+        ordering = ['-last_message_at']
+        indexes = [
+            models.Index(fields=['-last_message_at']),
+            models.Index(fields=['type']),
+        ]
+    
+    def __str__(self):
+        if self.type == 'DIRECT':
+            return f"Chat directo #{self.id}"
+        return self.name or f"Grupo #{self.id}"
+    
+    def get_other_user(self, current_user):
+        """Para conversaciones directas, obtiene el otro usuario"""
+        if self.type == 'DIRECT':
+            return self.participants.exclude(id=current_user.id).first()
+        return None
+    
+    def update_last_message(self, message):
+        """Actualiza el preview del último mensaje"""
+        self.last_message_at = message.created_at
+        if message.type == 'TEXT':
+            self.last_message_preview = message.text[:200]
+        elif message.type == 'IMAGE':
+            self.last_message_preview = "📷 Imagen"
+        elif message.type == 'FILE':
+            self.last_message_preview = f"📎 {message.attachment_name}"
+        else:
+            self.last_message_preview = message.text[:200]
+        self.save(update_fields=['last_message_at', 'last_message_preview'])
+
+
+class Message(models.Model):
+    """Mensaje dentro de una conversación"""
+    MESSAGE_TYPES = [
+        ('TEXT', 'Texto'),
+        ('IMAGE', 'Imagen'),
+        ('FILE', 'Archivo'),
+        ('SYSTEM', 'Sistema'),
+    ]
+    
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
+    sender = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_messages')
+    type = models.CharField(max_length=10, choices=MESSAGE_TYPES, default='TEXT')
+    text = models.TextField(blank=True)
+    
+    # Adjuntos
+    attachment = models.FileField(upload_to='chat_attachments/%Y/%m/', null=True, blank=True)
+    attachment_thumbnail = models.ImageField(upload_to='chat_thumbnails/%Y/%m/', null=True, blank=True)
+    attachment_name = models.CharField(max_length=255, blank=True)
+    attachment_size = models.IntegerField(null=True, blank=True, help_text="Tamaño en bytes")
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    
+    # Estado
+    is_deleted = models.BooleanField(default=False)
+    
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['conversation', 'created_at']),
+            models.Index(fields=['sender']),
+        ]
+    
+    def __str__(self):
+        return f"Mensaje de {self.sender.username} en {self.conversation}"
+    
+    def mark_as_read_by(self, user):
+        """Marca el mensaje como leído por un usuario"""
+        MessageReadStatus.objects.get_or_create(message=self, user=user)
+    
+    def is_read_by(self, user):
+        """Verifica si el mensaje fue leído por un usuario"""
+        return MessageReadStatus.objects.filter(message=self, user=user).exists()
+    
+    def get_read_by_users(self):
+        """Obtiene la lista de usuarios que leyeron el mensaje"""
+        return User.objects.filter(read_messages__message=self)
+
+
+class MessageReadStatus(models.Model):
+    """Estado de lectura de mensajes"""
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name='read_statuses')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='read_messages')
+    read_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ('message', 'user')
+        indexes = [
+            models.Index(fields=['message', 'user']),
+        ]
+        verbose_name_plural = "Message read statuses"
+    
+    def __str__(self):
+        return f"{self.user.username} leyó mensaje #{self.message.id}"

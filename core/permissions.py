@@ -13,9 +13,12 @@ class IsOwnerOrAdmin(BasePermission):
     """
     def has_object_permission(self, request, view, obj):
         # Los admins pueden hacer todo
-        if request.user and (request.user.is_staff or getattr(request.user, 'profile', {}).get('role') == 'ADMIN'):
-            return True
+        if request.user and request.user.is_authenticated:
+            if request.user.is_staff:
+                return True
+            if hasattr(request.user, 'profile') and request.user.profile.role == 'ADMIN':
+                return True
         
         # El dueño del objeto puede hacer todo sobre su objeto
         # Asume que el objeto tiene un campo 'user'.
-        return obj.user == request.user
+        return hasattr(obj, 'user') and obj.user == request.user
